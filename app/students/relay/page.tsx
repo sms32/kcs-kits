@@ -7,8 +7,14 @@ import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/auth-context";
 import { useProctor } from "@/lib/proctor";
 import { api } from "@/lib/api-client";
-import { runPython, warmUpPython } from "@/lib/py-runner";
-import { normalizeOutput, PublicQuestion, TIER_LABEL, TYPE_LABEL } from "@/lib/relay";
+import { runCode, warmUpRunners } from "@/lib/code-runner";
+import {
+  LANGUAGE_FILE,
+  normalizeOutput,
+  PublicQuestion,
+  TIER_LABEL,
+  TYPE_LABEL,
+} from "@/lib/relay";
 import AppHeader from "@/components/app-header";
 
 interface Cfg {
@@ -52,6 +58,9 @@ type Busy = "" | "run" | "check" | "submit" | "pass" | "skip" | "end" | "begin" 
 
 const PAUSE_CAP = 60_000; // must match the server
 const DEFAULT_CAP = 5;
+
+// Code Relay is C++ only
+const LANG = "cpp" as const;
 
 const fmt = (ms: number) => {
   const s = Math.max(0, Math.ceil(ms / 1000));
@@ -98,6 +107,8 @@ export default function RelayPage() {
   const [busy, setBusy] = useState<Busy>("");
   const [notice, setNotice] = useState<{ kind: "ok" | "bad"; text: string } | null>(null);
   const [retry, setRetry] = useState(0);
+  const [qError, setQError] = useState<string | null>(null); // why the question did not load
+  const [qTry, setQTry] = useState(0); // bump to load the question again
   const [awaitNext, setAwaitNext] = useState(false); // waiting for the next question to show
   const [confirmSkip, setConfirmSkip] = useState(false);
   const [confirmEnd, setConfirmEnd] = useState(false);
@@ -125,7 +136,7 @@ export default function RelayPage() {
   );
 
   useEffect(() => {
-    warmUpPython();
+    warmUpRunners(LANG);
     const t0 = Date.now();
     fetch("/api/time")
       .then((r) => r.json())
@@ -238,15 +249,19 @@ export default function RelayPage() {
   const nextName = team && !isLast ? team.memberNames[team.holder + 1] : "";
 
   // ---------- question ----------
+  // Loads the current question. If the request fails it shows why and tries again
+  // by itself, so a student is never left on a silent spinner.
   useEffect(() => {
     if (!arena || !teamId) return;
     let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     api<{ question: PublicQuestion; index: number; total: number }>("/api/relay", {
       action: "question",
       teamId,
     })
       .then((r) => {
         if (!alive) return;
+        setQError(null);
         setQuestion({ ...r.question, index: r.index, total: r.total });
         setInputText(r.question.sampleInput);
         setRunOut(null);
@@ -260,11 +275,16 @@ export default function RelayPage() {
           });
         }
       })
-      .catch(() => {});
+      .catch((e) => {
+        if (!alive) return;
+        setQError((e as Error)?.message || "unknown-error");
+        timer = setTimeout(() => setQTry((n) => n + 1), 3000);
+      });
     return () => {
       alive = false;
+      if (timer) clearTimeout(timer);
     };
-  }, [arena, teamId, team?.qIndex, cfg?.roundId]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [arena, teamId, team?.qIndex, cfg?.roundId, qTry]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // the code lives in this browser only (survives a reload), never in the database
   const storeKey =
@@ -324,7 +344,9 @@ export default function RelayPage() {
       e.preventDefault();
       const before = el.value.slice(0, el.selectionStart);
       const line = before.slice(before.lastIndexOf("\n") + 1);
-      const indent = (line.match(/^ */)?.[0] ?? "") + (line.trimEnd().endsWith(":") ? "    " : "");
+      // C++ blocks open with "{"
+      const indent =
+        (line.match(/^ */)?.[0] ?? "") + (line.trimEnd().endsWith("{") ? "    " : "");
       insert("\n" + indent);
     }
   }
@@ -367,7 +389,7 @@ export default function RelayPage() {
     if (busy || !question) return;
     setBusy("run");
     setRunOut(null);
-    const [r] = await runPython(code, [inputText], 8000);
+    const [r] = await runCode(LANG, code, [inputText], 8000);
     const isSample = normalizeOutput(inputText) === normalizeOutput(question.sampleInput);
     setRunOut({
       output: r.output,
@@ -391,7 +413,7 @@ export default function RelayPage() {
         action: "start",
         teamId,
       });
-      const results = await runPython(code, inputs, 15000);
+      const results = await runCode(LANG, code, inputs, 15000);
       const res = await api<{ results: boolean[] }>("/api/relay", {
         action: "check",
         teamId,
@@ -422,7 +444,7 @@ export default function RelayPage() {
         action: "start",
         teamId,
       });
-      const results = await runPython(code, inputs, 15000);
+      const results = await runCode(LANG, code, inputs, 15000);
       const res = await api<{ ok: boolean; finished: boolean }>("/api/relay", {
         action: "finish",
         teamId,
@@ -695,10 +717,31 @@ export default function RelayPage() {
       </div>
     );
   } else if (!question) {
+    const friendly: Record<string, string> = {
+      "no-question": "Your team has no question assigned yet.",
+      "question-missing": "Your question is missing from the bank.",
+      "bank-not-ready": "The question outputs have not been computed yet.",
+      "round-not-running": "The round is not running.",
+      "not-begun": "Your team has not started the relay.",
+    };
     body = (
       <div className="flex flex-col items-center gap-3 py-24 text-sm text-slate-600">
-        <Spinner />
-        Loading your question…
+        {qError ? (
+          <>
+            <p className="max-w-md text-center font-medium text-red-700">
+              Could not load your question. {friendly[qError] ?? qError}
+            </p>
+            <p>Trying again automatically. If this stays, tell an organiser.</p>
+            <button className={btnGhost} onClick={() => setQTry((n) => n + 1)}>
+              Retry now
+            </button>
+          </>
+        ) : (
+          <>
+            <Spinner />
+            Loading your question…
+          </>
+        )}
       </div>
     );
   } else {
@@ -875,7 +918,9 @@ export default function RelayPage() {
           {/* editor */}
           <div className={`${card} lg:col-span-3`}>
             <div className="mb-2 flex items-center justify-between">
-              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">main.py</p>
+              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                {LANGUAGE_FILE[LANG]}
+              </p>
               {locked && !busy && <span className="text-xs font-medium text-amber-700">Editor locked</span>}
             </div>
             <textarea
